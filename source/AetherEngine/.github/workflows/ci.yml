@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # One toolchain: GitHub's `xcode-27` image (macOS 27.0, default Xcode 27.0 27A266a), the same
+  # Xcode the engine is consumed and released from. The earlier macos-15 lanes resolved
+  # `latest-stable` to Xcode 26.3, whose Swift 6.2 disagreed with 6.4 in both directions (6.4
+  # rejects isolation shapes 6.3 accepted, 2026-09-16; 6.2 timed out type-checking a literal sum
+  # inside #expect, 2026-09-30), and nothing downstream builds with 26.x any more, so the README's
+  # requirement is Xcode 27 and CI tests exactly that. `xcode-27` is still a GitHub preview image.
+  # Its flaky `swift test` runs of mid-September were on a beta macOS 27 base with Xcode 27
+  # beta 6; the image moved to macOS 27 on 2026-09-16. If it turns unstable again, that shows as
+  # a lane red for its image, which is the signal to wait for the GA label, not to lower the bar.
+  # All three macOS jobs use it, which stays within the account's concurrent macOS runners.
+  test-macos:
+    name: swift test (macOS)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: swift build
+        run: swift build
+
+      # A test process that dies mid-run reads as exit 1 with no ✘, no backtrace and no swift-testing
+      # summary: `swift test` collapses every abnormal child exit to a plain 1, and a signal takes the
+      # buffered tail of the event stream with it. What was in flight is whatever the log still lists
+      # as started but never finished. Three such deaths were an unguarded socket write raising
+      # SIGPIPE from a test origin server (see the SO_NOSIGPIPE note in Issue177IngestPrefetchTests),
+      # so nothing hangs and no time limit would have caught it.
+      - name: swift test
+        run: swift test
+
+      # The same Swift Testing suite on a ONE-thread cooperative pool. Anything that blocks a pool
+      # thread (a sync read, a semaphore, a `Task.detached` around engine I/O) starves every other
+      # test here deterministically, instead of a different victim timing out on some later run of
+      # the 3-core runner. See docs/architecture.md, "Blocking work and the cooperative pool".
+      - name: swift test (one-thread cooperative pool)
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
+        run: swift test --skip-build --disable-xctest
+
+      - name: Software VOD packet-cache regressions
+        run: |
+          bash Scripts/test-software-packet-coverage.sh
+          bash Scripts/test-software-video-packet-coverage.sh
+          bash Scripts/test-software-packet-disk-fifo.sh
+          bash Scripts/test-software-packet-read-ahead.sh
+          bash Scripts/test-software-read-admission.sh
+          bash Scripts/test-software-stored-packet.sh
+
+      - name: Partial H.264 composition-offset runtime regression
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          bash Scripts/test-h264-partial-composition-controls.sh
+
+      # The transport probe is a device harness and runs nowhere in CI, so nothing else would keep
+      # it compiling. A harness that stopped building is discovered by the person who needed it.
+      - name: build the transport probe (AE#377)
+        run: swift build --build-tests --package-path Probes/TransportProbe
+
+  build-tvos:
+    name: xcodebuild (tvOS + visionOS Simulator)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The test target is the only place a platform gate in TEST code is ever checked. `swift test`
+      # on macOS compiles the macOS side of every `#if`, so a gate put around a helper instead of
+      # around the tests that call it looks complete there and costs nothing until someone builds
+      # for a simulator. That is how `AetherEngineTests` stopped compiling for iOS and tvOS without
+      # a single red run (2026-09-14, HLSOriginRelayTests).
+      #
+      # EXCLUDED_ARCHS because a generic simulator destination builds both slices and `libdovi.a`
+      # ships arm64 only, so the x86_64 link fails and says nothing about this repo.
+      #
+      # This step also compiles the library, so no separate `xcodebuild build` of the AetherEngine
+      # scheme runs first: that doubled every simulator job's compile, and the x86_64 slice it added
+      # is one no app can link anyway.
+      - name: Build the tests for tvOS Simulator
+        run: |
+          xcodebuild build-for-testing \
+            -scheme AetherEngineTests \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-tvos \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO
+
+      # The transport probe also builds as an app-hosted test bundle, because a SwiftPM test target
+      # is tool-hosted and tool-hosted testing does not exist on device destinations. That project
+      # runs nowhere in CI either, and the person who discovers it stopped building is the one who
+      # needed it that evening.
+      - name: Build the transport probe's device harness (AE#377)
+        run: |
+          xcodebuild build-for-testing \
+            -project Probes/TransportProbe/Device/TransportProbe.xcodeproj \
+            -scheme TransportProbe \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-probe \
+            CODE_SIGNING_ALLOWED=NO
+
+      # #344: the package has declared visionOS since 6.0.0 and nothing here compiled for it, so an
+      # availability list that named tvOS/iOS/macOS and then fell through to `*` broke the visionOS
+      # build silently. `*` resolves to the declared visionOS floor (1.0), so any API newer than that
+      # is a compile error on visionOS and on no other platform. Nobody here owns a Vision Pro, which
+      # makes this step the only place the platform is exercised at all. It rides in this job so CI
+      # stays within the account's concurrent macOS runners instead of queueing a sixth job.
+      - name: Build for visionOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme AetherEngine \
+            -destination 'generic/platform=visionOS Simulator' \
+            -derivedDataPath .build/xcode-visionos \
+            CODE_SIGNING_ALLOWED=NO
+
+  build-ios:
+    name: xcodebuild (iOS Simulator) + release aetherctl
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The other half of the gate check above; see the tvOS job for why the test target needs its
+      # own build and why x86_64 is excluded.
+      - name: Build the tests for iOS Simulator
+        run: |
+          xcodebuild build-for-testing \
+            -scheme AetherEngineTests \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath .build/xcode-ios \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO
+
+      # Every other Swift step in CI is Debug, and aetherctl is not a product, so no consumer compiles
+      # it either: a DEBUG-only engine hook called without a guard kept Release broken from 7.6.0 to
+      # 7.14.0 without anything noticing (AE#610). Off the `swift test` job's critical path.
+      - name: swift build -c release (aetherctl)
+        run: swift build -c release --product aetherctl
+
+  # The docs site (aetherengine-website) validates every heading anchor at build time, but it
+  # lives in another repo and only builds AFTER a push to main, so a broken anchor ships first
+  # and is found second: `docs/api.md` linked `formats.md#dolby-vision` against a heading that
+  # slugs to `#dolby-vision-signaling`, and the site build failed on every dispatch from 6.58.0
+  # until someone looked. Same check, here, before the merge. Ubuntu on purpose: it needs no
+  # toolchain and no network, so it reports in seconds while the macOS jobs are still starting.
+  docs-links:
+    name: docs links
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate relative links and heading anchors in the published docs
+        run: python3 Scripts/check-doc-links.py

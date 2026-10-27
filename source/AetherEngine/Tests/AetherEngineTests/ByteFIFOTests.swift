@@ -1,0 +1,110 @@
+import XCTest
+@testable import AetherEngine
+
+final class ByteFIFOTests: XCTestCase {
+
+    func testWriteThenReadRoundTrip() {
+        let fifo = ByteFIFO(capacity: 1024)
+        XCTAssertTrue(fifo.write(Data([1, 2, 3, 4])))
+        var buffer = [UInt8](repeating: 0, count: 8)
+        let n = buffer.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 8)
+        }
+        XCTAssertEqual(n, 4)
+        XCTAssertEqual(Array(buffer[0..<4]), [1, 2, 3, 4])
+    }
+
+    func testReadBlocksUntilWrite() {
+        let fifo = ByteFIFO(capacity: 1024)
+        let expectation = expectation(description: "read returned")
+        Thread.detachNewThread {
+            var buffer = [UInt8](repeating: 0, count: 4)
+            let n = buffer.withUnsafeMutableBufferPointer {
+                fifo.read(into: $0.baseAddress!, maxLength: 4)
+            }
+            XCTAssertEqual(n, 2)
+            expectation.fulfill()
+        }
+        while fifo.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
+        XCTAssertTrue(fifo.write(Data([9, 9])))
+        wait(for: [expectation], timeout: 300)
+    }
+
+    func testFinishDrainsThenSignalsEOF() {
+        let fifo = ByteFIFO(capacity: 1024)
+        _ = fifo.write(Data([7]))
+        fifo.finish()
+        var buffer = [UInt8](repeating: 0, count: 4)
+        let first = buffer.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 4)
+        }
+        XCTAssertEqual(first, 1)
+        let second = buffer.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 4)
+        }
+        XCTAssertEqual(second, 0, "EOF after drain")
+    }
+
+    func testCancelUnblocksReaderWithError() {
+        let fifo = ByteFIFO(capacity: 1024)
+        let expectation = expectation(description: "read returned")
+        Thread.detachNewThread {
+            var buffer = [UInt8](repeating: 0, count: 4)
+            let n = buffer.withUnsafeMutableBufferPointer {
+                fifo.read(into: $0.baseAddress!, maxLength: 4)
+            }
+            XCTAssertEqual(n, -1, "cancel surfaces as read error")
+            expectation.fulfill()
+        }
+        while fifo.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
+        fifo.cancel()
+        wait(for: [expectation], timeout: 300)
+    }
+
+    // audit NET-8: storage moved from one re-based `Data` to a queue of chunks plus a head offset;
+    // these pin that a read still spans chunk boundaries and resumes mid-chunk correctly.
+    func testReadSpansMultipleWrites() {
+        let fifo = ByteFIFO(capacity: 1024)
+        XCTAssertTrue(fifo.write(Data([1, 2])))
+        XCTAssertTrue(fifo.write(Data([3, 4, 5])))
+        var buffer = [UInt8](repeating: 0, count: 10)
+        let n = buffer.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 10)
+        }
+        XCTAssertEqual(n, 5)
+        XCTAssertEqual(Array(buffer[0..<5]), [1, 2, 3, 4, 5])
+    }
+
+    func testPartialReadResumesMidChunk() {
+        let fifo = ByteFIFO(capacity: 1024)
+        XCTAssertTrue(fifo.write(Data([1, 2, 3, 4, 5, 6])))
+        var first = [UInt8](repeating: 0, count: 3)
+        let n1 = first.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 3)
+        }
+        XCTAssertEqual(n1, 3)
+        XCTAssertEqual(Array(first[0..<3]), [1, 2, 3])
+        var second = [UInt8](repeating: 0, count: 3)
+        let n2 = second.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 3)
+        }
+        XCTAssertEqual(n2, 3)
+        XCTAssertEqual(Array(second[0..<3]), [4, 5, 6])
+    }
+
+    func testWriteBlocksAtCapacityUntilRead() {
+        let fifo = ByteFIFO(capacity: 4)
+        XCTAssertTrue(fifo.write(Data([1, 2, 3, 4])))
+        let expectation = expectation(description: "second write returned")
+        Thread.detachNewThread {
+            XCTAssertTrue(fifo.write(Data([5, 6])))
+            expectation.fulfill()
+        }
+        while fifo.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
+        var buffer = [UInt8](repeating: 0, count: 4)
+        _ = buffer.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 4)
+        }
+        wait(for: [expectation], timeout: 300)
+    }
+}

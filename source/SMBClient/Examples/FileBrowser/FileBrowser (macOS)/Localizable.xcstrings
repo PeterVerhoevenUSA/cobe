@@ -1,0 +1,21 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Activities" : {
+
+    },
+    "Connect" : {
+
+    },
+    "New Folder" : {
+
+    },
+    "Queued" : {
+      "comment" : "(progressBytes) of (totalBytes)"
+    },
+    "untitled folder" : {
+
+    }
+  },
+  "version" : "1.0"
+}
