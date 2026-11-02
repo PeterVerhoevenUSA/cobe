@@ -12,6 +12,24 @@ public enum LiveStuckClip {
     }
     private static let lock = NSLock()
     nonisolated(unsafe) private static var _onStuck: (@Sendable () -> Void)?
+
+    /// Clips caught stuck, by their first video packet (its clock and size): the same clip at another provider, or after
+    /// a fresh install, is known from its very first packet instead of after two rounds (the same ad
+    /// played 40 s at every new source). One clip recorded 2026-10-28 is known from the start.
+    private static let knownKey = "aether.stuckClips"
+    private static let builtIn: Set<String> = ["9009000|41594", "126000|41594"]
+    static func fingerprint(dts: Int64, size: Int32) -> String { "\(dts)|\(size)" }
+    /// `learned`: also the clips caught on this TV. Only at a reconnect: a first packet can be an intro every stream of a
+    /// service starts with (Pluto TV), so one caught clip there would flag all its channels (Fire TV build found it).
+    static func isKnown(_ fingerprint: String, learned: Bool = true) -> Bool {
+        builtIn.contains(fingerprint) || (learned && (UserDefaults.standard.stringArray(forKey: knownKey) ?? []).contains(fingerprint))
+    }
+    static func remember(_ fingerprint: String) {
+        var all = UserDefaults.standard.stringArray(forKey: knownKey) ?? []
+        guard !all.contains(fingerprint) else { return }
+        all.append(fingerprint)
+        UserDefaults.standard.set(Array(all.suffix(50)), forKey: knownKey)
+    }
 }
 
 /// Pump-thread-only.

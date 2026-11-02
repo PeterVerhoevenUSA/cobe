@@ -1,3 +1,7 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -0,0 +1 @@
++.build/
 --- a/Package.swift
 +++ b/Package.swift
 @@ -43,7 +43,7 @@
@@ -42,7 +46,21 @@
          lastVideoSourceDts = predecessor.lastVideoSourceDts
          lastAudioSourceDts = predecessor.lastAudioSourceDts
          EngineLog.emit("[HLSSegmentProducer] live source replay history continued: entries=\(liveReplayGuard.historyEntryCount)",
-@@ -1216,6 +1222,7 @@
+@@ -470,6 +476,8 @@
+ 
+     /// First dts ever seen per stream; replay detection: backward rebase landing near this + recent reconnect = server replay.
+     private var firstSeenVideoSourceDts: Int64 = Int64.min
++    /// The first video packet of a live source (clock and size), to know a stuck clip again (LiveStuckClip).
++    private var firstVideoFingerprint: String?
+     private var firstSeenAudioSourceDts: Int64 = Int64.min
+ 
+     private static let sourceReplayReconnectWindowSeconds: TimeInterval = 30
+@@ -1212,10 +1220,12 @@
+         lastPregateAudioLog = 0
+         pregateWaitStart = nil
+         firstSeenVideoSourceDts = Int64.min
++        firstVideoFingerprint = nil
+         firstSeenAudioSourceDts = Int64.min
          lastVideoSourceDts = Int64.min
          lastAudioSourceDts = Int64.min
          liveReplayGuard.reset()
@@ -50,7 +68,7 @@
          freeMergeLookaheads()
          packetCounterLock.lock()
          _lastPregateDroppedKeyframePts = Int64.min
-@@ -3128,6 +3135,15 @@
+@@ -3128,6 +3138,15 @@
              return nil
          }
          guard timeBaseSeconds > 0 else { return nil }
@@ -66,21 +84,47 @@
          let signature = LivePacketReplayGuard.Signature(
              stream: stream, dts: packet.pointee.dts, pts: packet.pointee.pts,
              payload: UnsafeRawBufferPointer(start: bytes, count: Int(packet.pointee.size)))
-@@ -3657,6 +3673,14 @@
-                                           stream: "video") {
+@@ -3658,6 +3677,25 @@
                              exitReason = .sourceReplay
                              break readLoop
-+                        }
-+                        if isLive, jumpTicks < 0, sourceVideoTbSeconds > 0,
+                         }
++                        // A reconnect that starts on a clip already caught stuck: left at once, not after two rounds.
++                        let restartPrint = LiveStuckClip.fingerprint(dts: packet.pointee.dts, size: packet.pointee.size)
++                        // Not on HLS: a service that fills unsold ad slots with the same bumper back to back (Pluto TV)
++                        // jumps back to the same point at every splice, a healthy stream (Fire TV build + ffprobe). The
++                        // stuck clip this watch is for comes over a plain transport stream that reconnects.
++                        let hlsSource = demuxer.containerFormatName == "hls"
++                        if isLive, !hlsSource, jumpTicks < 0, LiveStuckClip.isKnown(restartPrint) {
++                            EngineLog.emit("[HLSSegmentProducer] live source stuck: known clip at its restart", category: .session)
++                            LiveStuckClip.onStuck?()
++                        } else if isLive, !hlsSource, jumpTicks < 0, sourceVideoTbSeconds > 0,
 +                           stuckClipWatch.restarted(atSeconds: Double(packet.pointee.dts) * sourceVideoTbSeconds) {
++                            LiveStuckClip.remember(restartPrint)
 +                            EngineLog.emit(
 +                                "[HLSSegmentProducer] live source stuck: every connection restarts the same clip at "
 +                                + String(format: "%.2f", Double(packet.pointee.dts) * sourceVideoTbSeconds) + " s",
 +                                category: .session)
++                            if let firstVideoFingerprint { LiveStuckClip.remember(firstVideoFingerprint) }
 +                            LiveStuckClip.onStuck?()
-                         }
++                        }
                          liveReplayGuard.reset()
                          let (newShift, continuationDts) = Self.rebasedVideoShift(
+                             srcDts: packet.pointee.dts,
+@@ -3929,6 +3967,14 @@
+                     )
+                     if firstSeenVideoSourceDts == Int64.min {
+                         firstSeenVideoSourceDts = packet.pointee.dts
++                        if isLive {
++                            firstVideoFingerprint = LiveStuckClip.fingerprint(dts: packet.pointee.dts, size: packet.pointee.size)
++                            EngineLog.emit("[HLSSegmentProducer] live first video packet \(firstVideoFingerprint ?? "")", category: .session)
++                            if LiveStuckClip.isKnown(firstVideoFingerprint ?? "", learned: false) {
++                                EngineLog.emit("[HLSSegmentProducer] live source stuck: known clip from its first packet", category: .session)
++                                LiveStuckClip.onStuck?()
++                            }
++                        }
+                     }
+                     lastVideoSourceDts = packet.pointee.dts
+                 } else if isAudioPkt {
 --- a/Sources/AetherEngine/Video/LiveReplayPacketReader.swift
 +++ b/Sources/AetherEngine/Video/LiveReplayPacketReader.swift
 @@ -18,6 +18,7 @@
@@ -119,7 +163,7 @@
                 let data = packet.pointee.data, packet.pointee.size > 0 {
 --- a/Sources/AetherEngine/Video/LiveStuckClipWatch.swift
 +++ b/Sources/AetherEngine/Video/LiveStuckClipWatch.swift
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,53 @@
 +import Foundation
 +
 +/// Some live origins get stuck: every connection sends the very same clip (seen on an Xtream restream of a live channel,
@@ -134,6 +178,24 @@
 +    }
 +    private static let lock = NSLock()
 +    nonisolated(unsafe) private static var _onStuck: (@Sendable () -> Void)?
++
++    /// Clips caught stuck, by their first video packet (its clock and size): the same clip at another provider, or after
++    /// a fresh install, is known from its very first packet instead of after two rounds (the same ad
++    /// played 40 s at every new source). One clip recorded 2026-10-28 is known from the start.
++    private static let knownKey = "aether.stuckClips"
++    private static let builtIn: Set<String> = ["9009000|41594", "126000|41594"]
++    static func fingerprint(dts: Int64, size: Int32) -> String { "\(dts)|\(size)" }
++    /// `learned`: also the clips caught on this TV. Only at a reconnect: a first packet can be an intro every stream of a
++    /// service starts with (Pluto TV), so one caught clip there would flag all its channels (Fire TV build found it).
++    static func isKnown(_ fingerprint: String, learned: Bool = true) -> Bool {
++        builtIn.contains(fingerprint) || (learned && (UserDefaults.standard.stringArray(forKey: knownKey) ?? []).contains(fingerprint))
++    }
++    static func remember(_ fingerprint: String) {
++        var all = UserDefaults.standard.stringArray(forKey: knownKey) ?? []
++        guard !all.contains(fingerprint) else { return }
++        all.append(fingerprint)
++        UserDefaults.standard.set(Array(all.suffix(50)), forKey: knownKey)
++    }
 +}
 +
 +/// Pump-thread-only.

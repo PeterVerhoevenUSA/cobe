@@ -476,6 +476,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// First dts ever seen per stream; replay detection: backward rebase landing near this + recent reconnect = server replay.
     private var firstSeenVideoSourceDts: Int64 = Int64.min
+    /// The first video packet of a live source (clock and size), to know a stuck clip again (LiveStuckClip).
+    private var firstVideoFingerprint: String?
     private var firstSeenAudioSourceDts: Int64 = Int64.min
 
     private static let sourceReplayReconnectWindowSeconds: TimeInterval = 30
@@ -1218,6 +1220,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         lastPregateAudioLog = 0
         pregateWaitStart = nil
         firstSeenVideoSourceDts = Int64.min
+        firstVideoFingerprint = nil
         firstSeenAudioSourceDts = Int64.min
         lastVideoSourceDts = Int64.min
         lastAudioSourceDts = Int64.min
@@ -3674,12 +3677,23 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             exitReason = .sourceReplay
                             break readLoop
                         }
-                        if isLive, jumpTicks < 0, sourceVideoTbSeconds > 0,
+                        // A reconnect that starts on a clip already caught stuck: left at once, not after two rounds.
+                        let restartPrint = LiveStuckClip.fingerprint(dts: packet.pointee.dts, size: packet.pointee.size)
+                        // Not on HLS: a service that fills unsold ad slots with the same bumper back to back (Pluto TV)
+                        // jumps back to the same point at every splice, a healthy stream (Fire TV build + ffprobe). The
+                        // stuck clip this watch is for comes over a plain transport stream that reconnects.
+                        let hlsSource = demuxer.containerFormatName == "hls"
+                        if isLive, !hlsSource, jumpTicks < 0, LiveStuckClip.isKnown(restartPrint) {
+                            EngineLog.emit("[HLSSegmentProducer] live source stuck: known clip at its restart", category: .session)
+                            LiveStuckClip.onStuck?()
+                        } else if isLive, !hlsSource, jumpTicks < 0, sourceVideoTbSeconds > 0,
                            stuckClipWatch.restarted(atSeconds: Double(packet.pointee.dts) * sourceVideoTbSeconds) {
+                            LiveStuckClip.remember(restartPrint)
                             EngineLog.emit(
                                 "[HLSSegmentProducer] live source stuck: every connection restarts the same clip at "
                                 + String(format: "%.2f", Double(packet.pointee.dts) * sourceVideoTbSeconds) + " s",
                                 category: .session)
+                            if let firstVideoFingerprint { LiveStuckClip.remember(firstVideoFingerprint) }
                             LiveStuckClip.onStuck?()
                         }
                         liveReplayGuard.reset()
@@ -3953,6 +3967,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     )
                     if firstSeenVideoSourceDts == Int64.min {
                         firstSeenVideoSourceDts = packet.pointee.dts
+                        if isLive {
+                            firstVideoFingerprint = LiveStuckClip.fingerprint(dts: packet.pointee.dts, size: packet.pointee.size)
+                            EngineLog.emit("[HLSSegmentProducer] live first video packet \(firstVideoFingerprint ?? "")", category: .session)
+                            if LiveStuckClip.isKnown(firstVideoFingerprint ?? "", learned: false) {
+                                EngineLog.emit("[HLSSegmentProducer] live source stuck: known clip from its first packet", category: .session)
+                                LiveStuckClip.onStuck?()
+                            }
+                        }
                     }
                     lastVideoSourceDts = packet.pointee.dts
                 } else if isAudioPkt {
