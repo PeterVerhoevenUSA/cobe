@@ -1274,6 +1274,34 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
                     opened = awaitFirstPersistentData()
                 }
+                // Cobe: busy for now (429, 503, 509) says nothing about ranges. A one-connection account still counting the
+                // stream just closed answers so for seconds, and settling forward-only here lost the resume position and
+                // every seek. Ask the same range again, paced, while the origin keeps saying busy.
+                if !opened, !isLive {
+                    let started = Date()
+                    var pause: TimeInterval = 2
+                    while !opened, Date().timeIntervalSince(started) < 45 {
+                        winCond.lock()
+                        let busy = connEnded && Self.isRateLimitStatus(connStatus)
+                        let status = connStatus
+                        if busy {
+                            let until = Date(timeIntervalSinceNow: pause)
+                            while !isClosed, winCond.wait(until: until) {}
+                        }
+                        winCond.unlock()
+                        guard busy else { break }
+                        try probeControl?.check()
+                        guard !isClosed else { throw CancellationError() }
+                        EngineLog.emit("[AVIOReader] \(label) ranged open busy status=\(status) at offset 0; asking again after \(Int(pause)) s",
+                                       category: .demux)
+                        winCond.lock()
+                        rangeVerdictPending = true
+                        winCond.unlock()
+                        startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+                        opened = awaitFirstPersistentData()
+                        pause = min(pause * 2, 8)
+                    }
+                }
                 gotData = try recoverUnansweredOpenIfNeeded(gotData: opened)
                 openPrefix = firstWindowPrefix()
             }

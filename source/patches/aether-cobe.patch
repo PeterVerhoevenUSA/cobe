@@ -1,9 +1,66 @@
---- a/.gitignore
-+++ b/.gitignore
-@@ -0,0 +1 @@
-+.build/
---- a/Package.swift
-+++ b/Package.swift
+
+--- a/.gitignore	2026-11-07 19:41:42
++++ b/.gitignore	2026-10-16 16:27:55
+@@ -1,56 +1 @@
+-.DS_Store
+-# Match .build / Packages / .swiftpm at any depth so nested SwiftPM
+-# sub-packages (e.g. Examples/DemoPlayerMac) don't accidentally commit
+-# their build artifacts + checkout mirrors.
+ .build/
+-Packages/
+-.swiftpm/
+-xcuserdata/
+-
+-# ... with one exception: the SHARED scheme for the test target. Without it a fresh checkout has
+-# no `AetherEngineTests` scheme at all, so CI cannot build test code for a simulator and the only
+-# machine that can is the one where Xcode happened to create it. Re-including needs the whole
+-# chain: git does not descend into an excluded directory, so each level is opened in turn.
+-!/.swiftpm/
+-/.swiftpm/*
+-!/.swiftpm/xcode/
+-/.swiftpm/xcode/*
+-!/.swiftpm/xcode/xcshareddata/
+-DerivedData/
+-.netrc
+-build/
+-
+-# DemoPlayerMac is a demo that should always build against FFmpegBuild's
+-# current main HEAD (the same thing AetherEngine itself floats to). A
+-# committed lock here goes stale and silently breaks the release-dmg build
+-# when the engine starts importing a newly-added FFmpeg module (it pinned
+-# a pre-avfilter FFmpegBuild for the 2.1.1 dmg). Let swift build resolve it
+-# fresh each time instead. (The engine's own root Package.resolved stays
+-# tracked, that pin is bumped deliberately.)
+-Examples/DemoPlayerMac/Package.resolved
+-
+-# Generated test clips from Scripts/fetch-fixtures.sh + user-supplied
+-# samples in Fixtures/user/. Both are local-only by design; the script
+-# regenerates the synthetic clips on demand.
+-#
+-# No trailing slash, deliberately. `Fixtures/` matches only a directory, so a
+-# SYMLINK named Fixtures (a worktree pointing at the primary checkout's media,
+-# say) is not ignored and gets committed. Worse, git then feels free to check
+-# that symlink out over the real directory in another checkout, because an
+-# ignored path enjoys no protection from a checkout that wants it. That is how
+-# this repo's local fixture media was destroyed once, on 2026-09-01.
+-Fixtures
+-
+-# Internal design specs + implementation plans (superpowers flow).
+-# Local-only by design; never published to the public repo.
+-docs/superpowers/
+-
+-# Session scratch artifacts (debug fixtures, serve logs, reply drafts).
+-# Local-only by design; never published.
+-scratchpad/
+-
+-# Isolated feature worktrees.
+-.worktrees/
+-
+-# Local git worktrees created for feature work
+-.claude/worktrees/
+
+--- a/Package.swift	2026-11-07 19:41:42
++++ b/Package.swift	2026-10-20 17:06:26
 @@ -43,7 +43,7 @@
          // NWConnection. Replaces AMSMB2/libsmb2, which EPERMs on tvOS/iOS.
          // Pinned to the 0.3.x minor: SMBClient is pre-1.0 with an actively
@@ -13,8 +70,9 @@
          // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
          // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
          // LibDovi checkout; the prebuilt xcframework needs no Rust at build time.
---- a/Sources/AetherEngine/Demuxer/AVIOReader.swift
-+++ b/Sources/AetherEngine/Demuxer/AVIOReader.swift
+
+--- a/Sources/AetherEngine/Demuxer/AVIOReader.swift	2026-11-07 19:41:42
++++ b/Sources/AetherEngine/Demuxer/AVIOReader.swift	2026-11-04 16:25:42
 @@ -271,7 +271,7 @@
              // a healthy session emits this once. Which target is pinned is half of every field
              // trace about a redirecting origin (#307, #377, #380), and behind `#if DEBUG` it was
@@ -24,8 +82,44 @@
          }
      }
  
---- a/Sources/AetherEngine/Video/HLSSegmentProducer.swift
-+++ b/Sources/AetherEngine/Video/HLSSegmentProducer.swift
+@@ -1273,6 +1273,34 @@
+                     winCond.unlock()
+                     startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+                     opened = awaitFirstPersistentData()
++                }
++                // Cobe: busy for now (429, 503, 509) says nothing about ranges. A one-connection account still counting the
++                // stream just closed answers so for seconds, and settling forward-only here lost the resume position and
++                // every seek. Ask the same range again, paced, while the origin keeps saying busy.
++                if !opened, !isLive {
++                    let started = Date()
++                    var pause: TimeInterval = 2
++                    while !opened, Date().timeIntervalSince(started) < 45 {
++                        winCond.lock()
++                        let busy = connEnded && Self.isRateLimitStatus(connStatus)
++                        let status = connStatus
++                        if busy {
++                            let until = Date(timeIntervalSinceNow: pause)
++                            while !isClosed, winCond.wait(until: until) {}
++                        }
++                        winCond.unlock()
++                        guard busy else { break }
++                        try probeControl?.check()
++                        guard !isClosed else { throw CancellationError() }
++                        EngineLog.emit("[AVIOReader] \(label) ranged open busy status=\(status) at offset 0; asking again after \(Int(pause)) s",
++                                       category: .demux)
++                        winCond.lock()
++                        rangeVerdictPending = true
++                        winCond.unlock()
++                        startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
++                        opened = awaitFirstPersistentData()
++                        pause = min(pause * 2, 8)
++                    }
+                 }
+                 gotData = try recoverUnansweredOpenIfNeeded(gotData: opened)
+                 openPrefix = firstWindowPrefix()
+
+--- a/Sources/AetherEngine/Video/HLSSegmentProducer.swift	2026-11-07 19:41:42
++++ b/Sources/AetherEngine/Video/HLSSegmentProducer.swift	2026-10-29 12:56:26
 @@ -433,6 +433,10 @@
      /// Pump-thread-only packet history for exact overlap after a live source reconnect.
      private var liveReplayGuard = LivePacketReplayGuard()
@@ -125,8 +219,9 @@
                      }
                      lastVideoSourceDts = packet.pointee.dts
                  } else if isAudioPkt {
---- a/Sources/AetherEngine/Video/LiveReplayPacketReader.swift
-+++ b/Sources/AetherEngine/Video/LiveReplayPacketReader.swift
+
+--- a/Sources/AetherEngine/Video/LiveReplayPacketReader.swift	2026-11-07 19:41:42
++++ b/Sources/AetherEngine/Video/LiveReplayPacketReader.swift	2026-10-16 16:08:07
 @@ -18,6 +18,7 @@
          var untimedBoundaryVideo = false
      }
@@ -161,8 +256,9 @@
              let seconds = Double(packet.pointee.dts) * timeBase
              if let stream, timeBase > 0, packet.pointee.dts != Int64.min, packet.pointee.pts != Int64.min,
                 let data = packet.pointee.data, packet.pointee.size > 0 {
---- a/Sources/AetherEngine/Video/LiveStuckClipWatch.swift
-+++ b/Sources/AetherEngine/Video/LiveStuckClipWatch.swift
+
+--- a/Sources/AetherEngine/Video/LiveStuckClipWatch.swift	1969-12-31 16:00:00
++++ b/Sources/AetherEngine/Video/LiveStuckClipWatch.swift	2026-11-02 10:39:04
 @@ -0,0 +1,53 @@
 +import Foundation
 +
@@ -217,8 +313,9 @@
 +        return reported
 +    }
 +}
---- a/Sources/AetherEngine/Video/LiveTimestampRebaser.swift
-+++ b/Sources/AetherEngine/Video/LiveTimestampRebaser.swift
+
+--- a/Sources/AetherEngine/Video/LiveTimestampRebaser.swift	1969-12-31 16:00:00
++++ b/Sources/AetherEngine/Video/LiveTimestampRebaser.swift	2026-10-16 16:25:44
 @@ -0,0 +1,105 @@
 +import CryptoKit
 +import Foundation
@@ -325,8 +422,9 @@
 +        }
 +    }
 +}
---- a/Tests/AetherEngineTests/LiveStuckClipWatchTests.swift
-+++ b/Tests/AetherEngineTests/LiveStuckClipWatchTests.swift
+
+--- a/Tests/AetherEngineTests/LiveStuckClipWatchTests.swift	1969-12-31 16:00:00
++++ b/Tests/AetherEngineTests/LiveStuckClipWatchTests.swift	2026-10-17 13:16:25
 @@ -0,0 +1,18 @@
 +import XCTest
 +@testable import AetherEngine
@@ -346,8 +444,9 @@
 +        XCTAssertFalse(watch.restarted(atSeconds: 140.3))
 +    }
 +}
---- a/Tests/AetherEngineTests/LiveTimestampRebaserTests.swift
-+++ b/Tests/AetherEngineTests/LiveTimestampRebaserTests.swift
+
+--- a/Tests/AetherEngineTests/LiveTimestampRebaserTests.swift	1969-12-31 16:00:00
++++ b/Tests/AetherEngineTests/LiveTimestampRebaserTests.swift	2026-10-16 16:11:15
 @@ -0,0 +1,61 @@
 +import XCTest
 +@testable import AetherEngine
@@ -410,8 +509,9 @@
 +        XCTAssertFalse(shifted)
 +    }
 +}
---- a/Tests/AetherEngineTests/RealResetClockReplayTests.swift
-+++ b/Tests/AetherEngineTests/RealResetClockReplayTests.swift
+
+--- a/Tests/AetherEngineTests/RealResetClockReplayTests.swift	1969-12-31 16:00:00
++++ b/Tests/AetherEngineTests/RealResetClockReplayTests.swift	2026-10-16 16:27:08
 @@ -0,0 +1,94 @@
 +import Foundation
 +import Testing

@@ -22,6 +22,7 @@ FFmpeg and its companions are inside Cobe as separate dynamic frameworks (`Frame
 - `AVIOReader.swift`: one log line also names the stream file.
 - `Package.swift`: uses Cobe's own copy of SMBClient (`../SMBClient`).
 - Tests for the above (`LiveTimestampRebaserTests`, `LiveStuckClipWatchTests`, `RealResetClockReplayTests`).
+- Update after Cobe 1.0 build 5: `AVIOReader.swift`: when a server answers "busy" (429, 503 or 509) while a film opens, the same range is asked again, paced 2, 4, 8, 8 s, for up to 45 s, instead of falling back to forward-only reading (a one-connection account still counting the previous stream lost the resume spot and seeking).
 
 **SMBClient** ([patches/smb-cobe.patch](patches/smb-cobe.patch)):
 - `Connection.swift`: reads whole framed packets from a buffer. The original read the 4-byte length from whatever a single TCP read returned and could crash on a short read.
